@@ -6,7 +6,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Устанавливаем Python пакеты
-RUN pip install --no-cache-dir flask flask-cors yt-dlp gunicorn
+RUN pip install --no-cache-dir flask flask-cors yt-dlp gunicorn requests
+
 
 # Копируем приложение
 WORKDIR /app
