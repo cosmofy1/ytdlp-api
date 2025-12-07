@@ -1,88 +1,110 @@
 import time
-import subprocess
-import requests
-from flask import Flask, jsonify, Response
+import asyncio
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+import yt_dlp
 
-app = Flask(__name__)
+app = FastAPI()
 
-# ===== КЕШ =====
-cache = {}
-CACHE_TTL = 18000  # 5 часов (YouTube ссылки живут около 5-6 часов)
+# ========== КЕШИРОВАНИЕ ==========
+audio_url_cache = {}
+CACHE_TTL = 18000  # 5 часов в секундах
 
-def get_cached(video_id):
-    """Возвращает кешированный URL, если не истёк"""
-    if video_id in cache:
-        entry = cache[video_id]
+def get_cached_url(video_id: str) -> str | None:
+    """Получить URL из кеша, если не истёк"""
+    if video_id in audio_url_cache:
+        entry = audio_url_cache[video_id]
         if entry['expires'] > time.time():
-            print(f"[CACHE HIT] {video_id}")
+            print(f"✅ [CACHE HIT] {video_id}")
             return entry['url']
         else:
-            del cache[video_id]
+            print(f"⏰ [CACHE EXPIRED] {video_id}")
+            del audio_url_cache[video_id]
     return None
 
-def set_cache(video_id, url):
-    """Сохраняет URL в кеш"""
-    cache[video_id] = {
+def set_cached_url(video_id: str, url: str):
+    """Сохранить URL в кеш"""
+    audio_url_cache[video_id] = {
         'url': url,
         'expires': time.time() + CACHE_TTL
     }
-    print(f"[CACHE SET] {video_id}")
+    print(f"💾 [CACHE SET] {video_id} -> expires in 5h")
 
-# ===== API =====
+# ========== YT-DLP ==========
+def extract_audio_url(video_id: str) -> str:
+    """Получить direct audio URL через yt-dlp"""
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+    }
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(
+            f"https://www.youtube.com/watch?v={video_id}", 
+            download=False
+        )
+        return info['url']
 
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
-
-@app.route("/audio/<video_id>")
-def get_audio(video_id):
-    cached = get_cached(video_id)
+# ========== ENDPOINTS ==========
+@app.get("/audio/{video_id}")
+async def get_audio_url(video_id: str):
+    """Возвращает direct audio URL (с кешированием)"""
+    
+    # 1. Проверить кеш
+    cached = get_cached_url(video_id)
     if cached:
-        return jsonify({"audioUrl": cached, "source": "cache", "videoId": video_id})
+        return {"audioUrl": cached, "source": "cache", "cached": True}
+    
+    # 2. Если нет в кеше — yt-dlp
+    print(f"🔍 [YT-DLP] Extracting {video_id}...")
+    start = time.time()
+    
+    url = extract_audio_url(video_id)
+    
+    elapsed = time.time() - start
+    print(f"✅ [YT-DLP] Done in {elapsed:.1f}s")
+    
+    # 3. Сохранить в кеш
+    set_cached_url(video_id, url)
+    
+    return {"audioUrl": url, "source": "yt-dlp", "cached": False}
 
-    result = subprocess.run([
-        "yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
-        "-g", f"https://youtube.com/watch?v={video_id}"
-    ], capture_output=True, text=True)
 
-    if result.returncode != 0 or not result.stdout.strip():
-        return jsonify({"error": "Failed to get audio URL"}), 500
-
-    url = result.stdout.strip()
-    set_cache(video_id, url)
-    return jsonify({"audioUrl": url, "source": "yt-dlp", "videoId": video_id})
-
-@app.route("/stream/<video_id>")
-def stream(video_id):
-    # 1. Проверяем кеш
-    cached = get_cached(video_id)
+@app.get("/stream/{video_id}")
+async def stream_audio(video_id: str):
+    """Стриминг аудио (с кешированием URL)"""
+    
+    # 1. Проверить кеш — если есть, стримим СРАЗУ
+    cached = get_cached_url(video_id)
     if cached:
-        print(f"[STREAM FROM CACHE] {video_id}")
-        audio_url = cached
-    else:
-        print(f"[STREAM NEW] {video_id}")
-        result = subprocess.run([
-            "yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
-            "-g", f"https://youtube.com/watch?v={video_id}"
-        ], capture_output=True, text=True)
+        print(f"🚀 [STREAM] Fast start from cache: {video_id}")
+        return await stream_from_url(cached)
+    
+    # 2. Если нет в кеше — получить и закешировать
+    print(f"⏳ [STREAM] Cache miss, extracting: {video_id}")
+    url = extract_audio_url(video_id)
+    set_cached_url(video_id, url)
+    
+    return await stream_from_url(url)
 
-        if result.returncode != 0 or not result.stdout.strip():
-            return jsonify({"error": "Failed to get audio URL"}), 500
 
-        audio_url = result.stdout.strip()
-        set_cache(video_id, audio_url)
-
-    # 2. Проксируем поток
-    def generate():
-        with requests.get(audio_url, stream=True) as r:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
+async def stream_from_url(url: str):
+    """Стриминг из direct URL"""
+    import httpx
+    
+    async def generate():
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", url) as response:
+                async for chunk in response.aiter_bytes(chunk_size=8192):
                     yield chunk
-
-    return Response(generate(),
-                    content_type="audio/mpeg",
-                    headers={"Access-Control-Allow-Origin": "*",
-                             "Accept-Ranges": "bytes"})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    
+    return StreamingResponse(
+        generate(),
+        media_type="audio/mpeg",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache",
+        }
+    )
