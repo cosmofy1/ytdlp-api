@@ -1,120 +1,88 @@
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+import time
 import subprocess
-import json
+import requests
+from flask import Flask, jsonify, Response
 
 app = Flask(__name__)
-CORS(app)
 
-# Простой кэш в памяти
+# ===== КЕШ =====
 cache = {}
+CACHE_TTL = 18000  # 5 часов (YouTube ссылки живут около 5-6 часов)
 
-@app.route('/audio/<video_id>')
-def get_audio(video_id):
-    # Проверяем кэш
+def get_cached(video_id):
+    """Возвращает кешированный URL, если не истёк"""
     if video_id in cache:
-        return jsonify(cache[video_id])
-    
-    try:
-        # Получаем прямой URL аудио
-        result = subprocess.run([
-            'yt-dlp',
-            '-g',  # Только URL, без скачивания
-            '-f', 'bestaudio[ext=m4a]/bestaudio',
-            '--no-warnings',
-            '--no-playlist',
-            f'https://youtube.com/watch?v={video_id}'
-        ], capture_output=True, text=True, timeout=30)
-        
-        if result.returncode == 0 and result.stdout.strip():
-            response = {
-                'audioUrl': result.stdout.strip(),
-                'source': 'yt-dlp',
-                'videoId': video_id
-            }
-            cache[video_id] = response
-            return jsonify(response)
-        
-        return jsonify({'error': 'Failed to get audio URL'}), 500
-        
-    except subprocess.TimeoutExpired:
-        return jsonify({'error': 'Timeout'}), 504
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        entry = cache[video_id]
+        if entry['expires'] > time.time():
+            print(f"[CACHE HIT] {video_id}")
+            return entry['url']
+        else:
+            del cache[video_id]
+    return None
 
-@app.route('/info/<video_id>')
-def get_info(video_id):
-    try:
-        result = subprocess.run([
-            'yt-dlp',
-            '-j',  # JSON информация
-            '--no-warnings',
-            '--no-playlist',
-            f'https://youtube.com/watch?v={video_id}'
-        ], capture_output=True, text=True, timeout=30)
-        
-        if result.returncode == 0:
-            info = json.loads(result.stdout)
-            return jsonify({
-                'title': info.get('title'),
-                'artist': info.get('artist') or info.get('uploader'),
-                'duration': info.get('duration'),
-                'thumbnail': info.get('thumbnail')
-            })
-        
-        return jsonify({'error': 'Failed'}), 500
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+def set_cache(video_id, url):
+    """Сохраняет URL в кеш"""
+    cache[video_id] = {
+        'url': url,
+        'expires': time.time() + CACHE_TTL
+    }
+    print(f"[CACHE SET] {video_id}")
 
-@app.route('/health')
+# ===== API =====
+
+@app.route("/health")
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({"status": "ok"})
 
-@app.route('/')
-def home():
-    return jsonify({
-        'service': 'yt-dlp API',
-        'endpoints': ['/audio/<video_id>', '/info/<video_id>', '/health']
-    })
+@app.route("/audio/<video_id>")
+def get_audio(video_id):
+    cached = get_cached(video_id)
+    if cached:
+        return jsonify({"audioUrl": cached, "source": "cache", "videoId": video_id})
 
-from flask import Response
-import requests
+    result = subprocess.run([
+        "yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
+        "-g", f"https://youtube.com/watch?v={video_id}"
+    ], capture_output=True, text=True)
 
-@app.route('/stream/<video_id>')
+    if result.returncode != 0 or not result.stdout.strip():
+        return jsonify({"error": "Failed to get audio URL"}), 500
+
+    url = result.stdout.strip()
+    set_cache(video_id, url)
+    return jsonify({"audioUrl": url, "source": "yt-dlp", "videoId": video_id})
+
+@app.route("/stream/<video_id>")
 def stream(video_id):
-    try:
-        # Получаем прямой URL аудио
+    # 1. Проверяем кеш
+    cached = get_cached(video_id)
+    if cached:
+        print(f"[STREAM FROM CACHE] {video_id}")
+        audio_url = cached
+    else:
+        print(f"[STREAM NEW] {video_id}")
         result = subprocess.run([
-            'yt-dlp',
-            '-g',
-            '-f', 'bestaudio[ext=m4a]/bestaudio',
-            '--no-warnings',
-            '--no-playlist',
-            f'https://youtube.com/watch?v={video_id}'
-        ], capture_output=True, text=True, timeout=30)
+            "yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
+            "-g", f"https://youtube.com/watch?v={video_id}"
+        ], capture_output=True, text=True)
 
         if result.returncode != 0 or not result.stdout.strip():
-            return jsonify({'error': 'Failed to get audio URL'}), 500
+            return jsonify({"error": "Failed to get audio URL"}), 500
 
         audio_url = result.stdout.strip()
+        set_cache(video_id, audio_url)
 
-        # Проксируем поток к пользователю
-        def generate():
-            with requests.get(audio_url, stream=True) as r:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        yield chunk
+    # 2. Проксируем поток
+    def generate():
+        with requests.get(audio_url, stream=True) as r:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
 
-        return Response(generate(),
-                        content_type='audio/mpeg',
-                        headers={
-                            "Accept-Ranges": "bytes",
-                            "Access-Control-Allow-Origin": "*"
-                        })
+    return Response(generate(),
+                    content_type="audio/mpeg",
+                    headers={"Access-Control-Allow-Origin": "*",
+                             "Accept-Ranges": "bytes"})
 
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
